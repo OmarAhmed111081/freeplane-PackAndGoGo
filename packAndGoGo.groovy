@@ -1,6 +1,6 @@
 // @ExecutionModes({on_single_node="/menu_bar/file"})
 /* Copyright (C) 2011-2012 Volker Boerchers
- * Copyright (C) 2023, 2024   macmarrum
+ * Copyright (C) 2023, 2024 macmarrum
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,7 +15,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 
 import org.freeplane.api.MindMap
 import org.freeplane.core.ui.CaseSensitiveFileNameExtensionFilter
@@ -32,53 +31,64 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 private byte[] getZipBytes(Map<File, String> fileToPathInZipMap, File mapFile, byte[] mapBytes) {
-    def byteArrayOutputStream = new ByteArrayOutputStream()
+    ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream()
     ZipOutputStream zipOutput = new ZipOutputStream(byteArrayOutputStream)
-    fileToPathInZipMap.each { file, path ->
-        zipOutput = addZipEntry(zipOutput, file, path)
+    
+    try {
+        fileToPathInZipMap.each { file, path ->
+            if (file.isFile()) {
+                addZipEntry(zipOutput, file, path)
+            }
+        }
+        
+        logger.info("zipMap: added ${mapFile.name}")
+        ZipEntry entry = new ZipEntry(mapFile.name)
+        entry.time = mapFile.lastModified()
+        zipOutput.putNextEntry(entry)
+        zipOutput.write(mapBytes)
+    } finally {
+        zipOutput.close()
     }
-    logger.info("zipMap: added ${mapFile.name}")
-    ZipEntry entry = new ZipEntry(mapFile.name)
-    entry.time = mapFile.lastModified()
-    zipOutput.putNextEntry(entry)
-    zipOutput << mapBytes
-    zipOutput.close()
+    
     return byteArrayOutputStream.toByteArray()
 }
 
-private ZipOutputStream addZipEntry(ZipOutputStream zipOutput, File file, String path) {
-    if (file.isDirectory() && !path.endsWith('/')) {
-        path += "/"
-    }
+private void addZipEntry(ZipOutputStream zipOutput, File file, String path) {
     logger.info("zipMap: added $path")
     ZipEntry entry = new ZipEntry(path)
     entry.time = file.lastModified()
     zipOutput.putNextEntry(entry)
-    if (file.isFile()) {
-        def fileInputStream = new FileInputStream(file)
-        zipOutput << fileInputStream
+    
+    // Use FileInputStream to stream file content directly into the zip output
+    FileInputStream fileInputStream = new FileInputStream(file)
+    try {
+        byte[] buffer = new byte[4096] // Buffer size
+        int bytesRead
+        while ((bytesRead = fileInputStream.read(buffer)) != -1) {
+            zipOutput.write(buffer, 0, bytesRead)
+        }
+    } finally {
         fileInputStream.close()
     }
-    return zipOutput
 }
 
 private String getPathInZip(File file, String dependenciesDir, Map<File, String> fileToPathInZipMap) {
     def mappedPath = fileToPathInZipMap[file]
-    if (mappedPath)
+    if (mappedPath) {
         return mappedPath
+    }
     def path = "${dependenciesDir}/${file.name}"
-    if (file.isDirectory())
+    if (file.isDirectory()) {
         path += '/'
-    // TODO: include the parent's name in the path for duplicates to make them more readable
+    }
     while (contains(fileToPathInZipMap.values(), path)) {
-        // if multiple file with the same name (but different directories) are referenced append something to the path
         path = path.replaceFirst('(\\.\\w+)?$', '1$1')
         logger.info("zipMap: mapped $file to $path")
     }
     return path
 }
 
-// the inline version did not work - Groovy bug?
+// Helper method for checking existence in a collection
 static boolean contains(Collection collection, String path) {
     return collection.contains(path)
 }
@@ -87,9 +97,9 @@ private static byte[] getBytes(MapModel map) {
     StringWriter stringWriter = new StringWriter(4 * 1024)
     BufferedWriter out = new BufferedWriter(stringWriter)
     def mapWriter = Controller.getCurrentModeController().getMapController().getMapWriter()
-    try { // since 1.11.8 (2f8e7017)
+    try {
         mapWriter.writeMapAsXml(map, out, Mode.FILE, MapClipboardController.CopiedNodeSet.ALL_NODES, false)
-    } catch (MissingMethodException) { // till 1.11.8 (2f8e7017)
+    } catch (MissingMethodException) {
         mapWriter.writeMapAsXml(map, out, Mode.FILE, true, false)
     }
     return stringWriter.buffer.toString().getBytes(StandardCharsets.UTF_8)
@@ -106,24 +116,18 @@ private File askForZipFile(File zipFile) {
     def zipFileFilter = new CaseSensitiveFileNameExtensionFilter('zip', 'ZIP files')
     def chooser = new JFileChooser(fileSelectionMode: JFileChooser.FILES_ONLY, fileFilter: zipFileFilter, selectedFile: zipFile)
     if (chooser.showSaveDialog() == JFileChooser.APPROVE_OPTION) {
-        if (!chooser.selectedFile.exists() || confirmOverwrite(chooser.selectedFile))
+        if (!chooser.selectedFile.exists() || confirmOverwrite(chooser.selectedFile)) {
             return chooser.selectedFile
+        }
     }
     return null
 }
 
-/**
- * It is used to collect unique file paths.
- * Canonical, so that ../ and ./ do not lead to different paths for the same file.
- * @return canonical file for the URI
- */
 static File getUriAsCanonicalFile(File mapDir, URI uri) {
     try {
-        if (uri == null)
-            return null
+        if (uri == null) return null
         def scheme = uri.scheme
         if (scheme == null || scheme == 'file') {
-            // uri.path is null when e.g. 'file:abc.txt', therefore uri.schemeSpecificPart
             def path = uri.path ?: uri.schemeSpecificPart
             def file = new File(path)
             return file.absolute ? file.canonicalFile : new File(mapDir, path).canonicalFile
@@ -135,21 +139,15 @@ static File getUriAsCanonicalFile(File mapDir, URI uri) {
     }
 }
 
-// searches the map for file references that have to be mapped to a file in the zip
 private createFileToPathInZipMap(MindMap newMindMap, String dependenciesDir) {
     File mapDir = node.mindMap.file.parentFile
-    // closure, re-usable for text, details and notes
     def handleHtmlText = { String text, Map<File, String> map ->
-        if (!text)
-            return text
-        // regex needs to cover single or double quotes surrounding the url
-        // special case: href="abc.mm#at(/**/'A%201%20b')"
+        if (!text) return text
         def links = ~/(href|src)=(["'])(.+)\2/
         def m = links.matcher(text)
-        // optimize for the regular case: no StringBuffer et al if there is no need for it
         if (m.find()) {
             def buffer = new StringBuffer()
-            for (; ;) {
+            for (;;) {
                 def ref = m.group(3)
                 def xpath = getMappedPath(ref, map, mapDir, dependenciesDir)
                 if (xpath) {
@@ -158,54 +156,53 @@ private createFileToPathInZipMap(MindMap newMindMap, String dependenciesDir) {
                 } else {
                     m.appendReplacement(buffer, m.group(0))
                 }
-                // Groovy has no do..while loop
-                if (!m.find())
-                    break
+                if (!m.find()) break
             }
             m.appendTail(buffer)
             return buffer.toString()
         }
         return text
     }
+    
     def fileToPathInZipMap = newMindMap.root.findAll().inject(new LinkedHashMap<File, String>()) { map, node ->
         def path
-        // == link
         path = getMappedPath(node.link.uri, map, mapDir, dependenciesDir)
-        if (path)
-            node.link.text = path
-        // == external object
+        if (path) node.link.text = path
         path = getMappedPath(node.externalObject.uri, map, mapDir, dependenciesDir)
         if (path) {
-            // when setting a string, externalObject.uri goes via new URL(str).toURI(), which requires protocol, hence fails for relative paths
             node.externalObject.uri = URI.create(path)
         }
-        // == attributes
+        
         def attributes = node.attributes
         attributes.eachWithIndex { value, i ->
             if (value instanceof URI) {
                 path = getMappedPath(value, map, mapDir, dependenciesDir)
-                if (path)
-                    attributes.set(i, new URI(path))
+                if (path) attributes.set(i, new URI(path))
             }
         }
+        
         def nodeText = node.text
-        if (htmlUtils.isHtmlNode(nodeText))
+        if (htmlUtils.isHtmlNode(nodeText)) {
             node.text = handleHtmlText(nodeText, map)
+        }
+        
         def detailsText = node.detailsText
-        if (detailsText)
+        if (detailsText) {
             node.detailsText = handleHtmlText(detailsText, map)
+        }
+        
         def noteText = node.noteText
-        if (noteText)
+        if (noteText) {
             node.noteText = handleHtmlText(noteText, map)
-
+        }
+        
         return map
     }
     return fileToPathInZipMap
 }
 
 private String getMappedPath(Object uriObject, Map<File, String> fileToPathInZipMap, File mapDir, String dependenciesDir) {
-    if (!uriObject)
-        return null
+    if (!uriObject) return null
     URI uri = (uriObject instanceof URI) ? uriObject : new URI(uriObject.toString())
     def f = getUriAsCanonicalFile(mapDir, uri)
     if (f != null && f.exists()) {
@@ -223,44 +220,10 @@ private static urlEncode(String string) {
 }
 
 private static String getText(String key, Object... parameters) {
-    if (parameters)
-        return MessageFormat.format(key, parameters)
-    return key
+    def pattern = getResourceText(key)
+    return MessageFormat.format(pattern, parameters)
 }
 
-boolean zipMap(File file) {
-    if (file == null) {
-        ui.errorMessage(getText('You have to save this map first'))
-        return
-    }
-    if (!node.mindMap.isSaved()) {
-        def question = getText('Do you want to save {0} first?', node.mindMap.name)
-        def title = getText('Create zip file')
-        final int selection = JOptionPane.showConfirmDialog(ui.frame, question, title, JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE)
-        if (selection == JOptionPane.YES_OPTION)
-            node.mindMap.save(false)
-        else if (selection == JOptionPane.CANCEL_OPTION)
-            return
-    }
-    def baseName = file.name.replaceFirst('\\.mm', '')
-    def zipFile = askForZipFile(new File(file.parentFile, baseName + '.zip'))
-    if (zipFile == null)
-        return
-    def dependenciesDir = "${baseName}-files"
-    MindMap newMindMap = c.mapLoader(file).unsetMapLocation().mindMap
-    if (newMindMap == null) {
-        ui.errorMessage(getText('Can not create a copy of {0}', file))
-        return
-    }
-    // original file -> zip file name
-    def fileToPathInZipMap = createFileToPathInZipMap(newMindMap, dependenciesDir)
-    // add the map itself
-    def bytes = getZipBytes(fileToPathInZipMap, file, getBytes(newMindMap.delegate))
-
-    zipFile.bytes = bytes
-    logger.info("zipMap: wrote ${zipFile.absolutePath}")
-    c.statusInfo = getText('wrote {0}', zipFile.absolutePath)
+private static String getResourceText(String key) {
+    return Controller.getCurrentController().getTextUtils().getText(key)
 }
-
-///////////////////// MAIN //////////////////////////
-zipMap(node.mindMap.file)
